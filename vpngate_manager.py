@@ -4211,15 +4211,19 @@ $("export_openclash").onclick = async () => {
   const oldHtml = btn.innerHTML;
   btn.textContent = "正在导出...";
   try {
-    const response = await fetch("./api/export_openclash", { method: "POST" });
-    const data = await response.json();
-    if (response.ok && data.ok) {
-      alert(`已导出 OpenClash YAML\n住宅节点数: ${data.residential_nodes}\nVPS 文件: ${data.path}\n订阅地址: ${data.subscription_url}`);
-    } else {
-      alert(data.error || "导出 OpenClash YAML 失败");
+    const response = await fetch("./sub.yaml", { method: "GET", cache: "no-store" });
+    const body = await response.text();
+    if (!response.ok) {
+      throw new Error(body.slice(0, 200) || `HTTP ${response.status}`);
     }
+    if (!body.trim().startsWith("proxies:")) {
+      throw new Error(body.slice(0, 200) || "返回内容不是 OpenClash YAML");
+    }
+    const residentialCount = (body.match(/^\s+- name:/gm) || []).length;
+    const subscriptionUrl = new URL("./sub.yaml", window.location.href).href;
+    alert(`已导出 OpenClash YAML\n住宅节点数: ${residentialCount}\nVPS 文件: ${state.openclash_path || "/opt/huayu/vpngate_data/openclash.yaml"}\n订阅地址: ${subscriptionUrl}`);
   } catch (e) {
-    alert("导出 OpenClash YAML 请求失败");
+    alert(`导出 OpenClash YAML 请求失败: ${e && e.message ? e.message : e}`);
   } finally {
     btn.disabled = false;
     btn.innerHTML = oldHtml;
