@@ -584,14 +584,37 @@ def active_proxy_port_for_node(node: dict[str, Any] | None) -> int:
 def yaml_quote(value: Any) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
+def primary_region_label(country_code: str, country: str, location: str, fallback: str) -> str:
+    compact_country = re.sub(r"[\s,，/|]+", "", country)
+    compact_location = re.sub(r"[\s,，/|]+", "", location)
+    region = compact_location or compact_country or fallback
+    if compact_country and region.startswith(compact_country):
+        region = region[len(compact_country):]
+
+    if country_code == "JP" or compact_country == "日本":
+        match = re.match(r"(.+?)(都|道|府|県|縣|县)", region)
+        if match:
+            name, suffix = match.groups()
+            region = name if suffix in ("県", "縣", "县") else f"{name}{suffix}"
+    elif country_code == "KR" or compact_country in ("韩国", "韓國"):
+        match = re.match(r"(.+?(?:特别自治道|特別自治道|特别市|特別市|广域市|廣域市|自治道|道|市))", region)
+        if match:
+            region = match.group(1)
+    else:
+        match = re.match(r"([\u3400-\u9fffぁ-ゟァ-ヿ가-힣]+)", region)
+        if match:
+            region = match.group(1)
+
+    if compact_country and region and not region.startswith(compact_country):
+        return f"{compact_country}{region}"
+    return region or compact_country or fallback
+
 def clash_node_name(node: dict[str, Any]) -> str:
     country_code = str(node.get("country_short") or "").strip().upper()
     country = str(node.get("country") or "").strip()
     location = str(node.get("location") or "").strip()
-    label = location or country or str(node.get("ip") or node.get("remote_host") or "住宅")
-    label = re.sub(r"[\s,，/|]+", "", label)
-    if country and label and not label.startswith(country):
-        label = f"{country}{label}"
+    fallback = str(node.get("ip") or node.get("remote_host") or "住宅")
+    label = primary_region_label(country_code, country, location, fallback)
     return f"{country_code}{label}-住宅" if country_code else f"{label}-住宅"
 
 def generate_openclash_subscription(

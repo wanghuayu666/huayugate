@@ -75,6 +75,38 @@ class OpenClashResidentialTests(unittest.TestCase):
         self.assertIn("port: 20001", yaml_text)
         self.assertNotIn("KR韩国首尔-住宅", yaml_text)
 
+    def test_clash_node_name_uses_country_and_primary_region(self):
+        cases = [
+            (
+                {
+                    "country": "日本",
+                    "country_short": "JP",
+                    "location": "日本長野縣伊那市",
+                },
+                "JP日本長野-住宅",
+            ),
+            (
+                {
+                    "country": "日本",
+                    "country_short": "JP",
+                    "location": "日本埼玉縣Nakamuramachi",
+                },
+                "JP日本埼玉-住宅",
+            ),
+            (
+                {
+                    "country": "韩国",
+                    "country_short": "KR",
+                    "location": "韩国京畿道Uijeongbu-si",
+                },
+                "KR韩国京畿道-住宅",
+            ),
+        ]
+
+        for node, expected_name in cases:
+            with self.subTest(expected_name=expected_name):
+                self.assertEqual(manager.clash_node_name(node), expected_name)
+
 
 if __name__ == "__main__":
     unittest.main()
