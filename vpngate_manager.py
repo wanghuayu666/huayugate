@@ -119,14 +119,9 @@ UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 RESIDENTIAL_PORT_BASE = env_int("RESIDENTIAL_PORT_BASE", 20000, 1024, 65535)
-RESIDENTIAL_WATCHDOG_INTERVAL_SECONDS = env_int("RESIDENTIAL_WATCHDOG_INTERVAL_SECONDS", 30, 1)
-RESIDENTIAL_WATCHDOG_FAIL_THRESHOLD = env_int("RESIDENTIAL_WATCHDOG_FAIL_THRESHOLD", 3, 1)
-RESIDENTIAL_WATCHDOG_LATENCY_THRESHOLD_MS = env_int("RESIDENTIAL_WATCHDOG_LATENCY_THRESHOLD_MS", 2000, 1)
-RESIDENTIAL_COOLDOWN_SECONDS = env_int("RESIDENTIAL_COOLDOWN_SECONDS", INVALID_BACKOFF_SECONDS, 1)
-RESIDENTIAL_MIN_DWELL_SECONDS = env_int("RESIDENTIAL_MIN_DWELL_SECONDS", 3 * 60, 0)
 OPENCLASH_URL_TEST_INTERVAL = env_int("OPENCLASH_URL_TEST_INTERVAL", 30, 1)
 OPENCLASH_HEALTHCHECK_URL = os.environ.get("OPENCLASH_HEALTHCHECK_URL", "http://www.gstatic.com/generate_204")
-OPENCLASH_GROUP_NAME = os.environ.get("OPENCLASH_GROUP_NAME", "🏠住宅出口")
+OPENCLASH_GROUP_NAME = os.environ.get("OPENCLASH_GROUP_NAME", "住宅出口")
 DATACENTER_ASN_KEYWORDS = (
     "amazon",
     "aws",
@@ -148,6 +143,9 @@ DATACENTER_ASN_KEYWORDS = (
     "alibaba",
     "tencent",
     "cloudflare",
+    "datacenter",
+    "data center",
+    "hosting",
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -158,6 +156,7 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+OPENCLASH_OUTPUT_FILE = DATA_DIR / "openclash.yaml"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -167,10 +166,9 @@ active_openvpn_node_id = ""
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
-active_listen_port = LOCAL_PROXY_PORT
-active_connected_at = 0.0
 proxy_gateway_handle: proxy_server.ProxyServerHandle | None = None
-proxy_gateway_lock = threading.RLock()
+proxy_gateway_lock = threading.Lock()
+active_listen_port = 0
 
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
@@ -273,6 +271,9 @@ def load_ui_config() -> dict[str, Any]:
                         updated = True
             except Exception:
                 pass
+        if config.get("routing_ip_type") != "residential":
+            config["routing_ip_type"] = "residential"
+            updated = True
         
         if not config.get("username"):
             config["username"] = generate_random_username()
@@ -393,13 +394,15 @@ def get_state() -> dict[str, Any]:
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
     _proxy_display = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-    state["active_listen_port"] = active_listen_port
-    state["local_proxy"] = f"http://{_proxy_display}:{active_listen_port}"
+    listen_port = active_listen_port or LOCAL_PROXY_PORT
+    state["local_proxy"] = f"http://{_proxy_display}:{listen_port}"
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
     state.setdefault("residential_port_base", RESIDENTIAL_PORT_BASE)
     state.setdefault("openclash_url_test_interval", OPENCLASH_URL_TEST_INTERVAL)
+    state["active_listen_port"] = active_listen_port
+    state["openclash_path"] = str(OPENCLASH_OUTPUT_FILE)
     
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -489,11 +492,10 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "node"
 
 def clear_active_connection_state(message: str) -> None:
-    global active_openvpn_process, active_openvpn_node_id, active_connected_at
+    global active_openvpn_process, active_openvpn_node_id
     stop_process(active_openvpn_process)
     active_openvpn_process = None
     active_openvpn_node_id = ""
-    active_connected_at = 0.0
     rebind_proxy_gateway(LOCAL_PROXY_PORT, "清理活动连接状态")
     with lock:
         nodes = read_nodes()
@@ -512,12 +514,6 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
-
-def parse_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
 
 def valid_residential_port(port: int) -> bool:
     return 1024 <= port <= 65535 and port not in (LOCAL_PROXY_PORT, UI_PORT)
@@ -538,16 +534,6 @@ def is_residential_node(node: dict[str, Any]) -> bool:
         return False
     return not node_has_datacenter_asn(node)
 
-def residential_rank_score(node: dict[str, Any]) -> int:
-    latency = parse_int(node.get("latency_ms")) or parse_int(node.get("ping")) or 9999
-    raw_score = min(max(parse_int(node.get("score")), 0), 10000)
-    fail_count = max(0, parse_int(node.get("fail_count")))
-    latency_score = max(0, 100 - min(latency, 3000) // 30)
-    source_score = min(50, raw_score // 200)
-    availability_bonus = 25 if node.get("probe_status") == "available" or node.get("active") else 0
-    penalty = min(80, fail_count * 20)
-    return max(0, min(100, latency_score + source_score + availability_bonus - penalty))
-
 def apply_residential_metadata(nodes: list[dict[str, Any]], previous_nodes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     previous_by_id = {
         str(item.get("id")): item
@@ -560,13 +546,7 @@ def apply_residential_metadata(nodes: list[dict[str, Any]], previous_nodes: list
     for node in nodes:
         node_id = str(node.get("id") or "")
         previous = previous_by_id.get(node_id, {})
-        if "fail_count" not in node:
-            node["fail_count"] = parse_int(previous.get("fail_count"))
-        if "cooldown_until" not in node:
-            node["cooldown_until"] = parse_float(previous.get("cooldown_until"))
         node["is_residential"] = is_residential_node(node)
-        node["residential_score"] = residential_rank_score(node)
-
         if not node["is_residential"]:
             node["assigned_port"] = 0
             continue
@@ -590,56 +570,9 @@ def apply_residential_metadata(nodes: list[dict[str, Any]], previous_nodes: list
         node["assigned_port"] = assigned_ports[node_id]
     return nodes
 
-def node_on_cooldown(node: dict[str, Any], now: float | None = None) -> bool:
-    check_time = time.time() if now is None else now
-    return parse_float(node.get("cooldown_until")) > check_time
-
-def sort_switch_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        nodes,
-        key=lambda n: (
-            -parse_int(n.get("residential_score")),
-            parse_int(n.get("latency_ms")) or 999999,
-            -parse_int(n.get("score")),
-        ),
-    )
-
-def select_switch_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any], allow_fallback: bool = True) -> tuple[list[dict[str, Any]], bool]:
-    now = time.time()
-    candidates = [
-        n for n in nodes
-        if n.get("probe_status") == "available"
-        and not n.get("active")
-        and not node_on_cooldown(n, now)
-    ]
-
-    routing_mode = ui_cfg.get("routing_mode", "auto")
-    target_country = ui_cfg.get("force_country", "")
-    if routing_mode == "fixed_region" and target_country:
-        candidates = [
-            n for n in candidates
-            if n.get("country") == target_country
-            or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
-        ]
-    elif routing_mode == "favorites":
-        fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-        fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
-        if fav_candidates:
-            candidates = fav_candidates
-        elif not ui_cfg.get("fav_fail_fallback", True):
-            candidates = []
-
-    routing_ip_type = ui_cfg.get("routing_ip_type", "residential")
-    if routing_ip_type == "hosting":
-        filtered = [n for n in candidates if n.get("ip_type") == "hosting"]
-        return sort_switch_candidates(filtered), False
-
-    residential = [n for n in candidates if n.get("is_residential")]
-    if residential:
-        return sort_switch_candidates(residential), False
-    if allow_fallback:
-        return sort_switch_candidates(candidates), True
-    return [], False
+def residential_nodes_only(nodes: list[dict[str, Any]], previous_nodes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    enriched = apply_residential_metadata(nodes, previous_nodes)
+    return [node for node in enriched if node.get("is_residential")]
 
 def active_proxy_port_for_node(node: dict[str, Any] | None) -> int:
     if node and node.get("is_residential"):
@@ -648,57 +581,18 @@ def active_proxy_port_for_node(node: dict[str, Any] | None) -> int:
             return assigned
     return LOCAL_PROXY_PORT
 
-def reset_node_failure(node_id: str) -> None:
-    if not node_id:
-        return
-    with lock:
-        nodes = read_nodes()
-        changed = False
-        for node in nodes:
-            if node.get("id") == node_id:
-                node["fail_count"] = 0
-                node["cooldown_until"] = 0
-                node["probe_status"] = "available"
-                node["probe_message"] = "Active node healthy"
-                changed = True
-                break
-        if changed:
-            apply_residential_metadata(nodes, nodes)
-            write_json(NODES_FILE, nodes)
-
-def record_node_failure(node_id: str, reason: str) -> tuple[bool, int]:
-    if not node_id:
-        return False, 0
-    with lock:
-        nodes = read_nodes()
-        node = next((item for item in nodes if item.get("id") == node_id), None)
-        if not node:
-            return False, 0
-        fail_count = max(0, parse_int(node.get("fail_count"))) + 1
-        node["fail_count"] = fail_count
-        node["probe_message"] = reason
-        threshold_reached = fail_count >= RESIDENTIAL_WATCHDOG_FAIL_THRESHOLD
-        if threshold_reached:
-            node["cooldown_until"] = time.time() + RESIDENTIAL_COOLDOWN_SECONDS
-            node["probe_status"] = "unavailable"
-            mark_blacklisted(node, reason)
-        apply_residential_metadata(nodes, nodes)
-        write_json(NODES_FILE, nodes)
-        return threshold_reached, fail_count
-
 def yaml_quote(value: Any) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 def clash_node_name(node: dict[str, Any]) -> str:
-    country = str(node.get("country_short") or node.get("country") or "XX")
-    location = str(node.get("location") or node.get("country") or "").strip()
-    ip = str(node.get("ip") or node.get("remote_host") or "")
-    parts = [country]
-    if location and location != country:
-        parts.append(location.replace(",", " "))
-    if ip:
-        parts.append(ip)
-    return "-".join(parts)
+    country_code = str(node.get("country_short") or "").strip().upper()
+    country = str(node.get("country") or "").strip()
+    location = str(node.get("location") or "").strip()
+    label = location or country or str(node.get("ip") or node.get("remote_host") or "住宅")
+    label = re.sub(r"[\s,，/|]+", "", label)
+    if country and label and not label.startswith(country):
+        label = f"{country}{label}"
+    return f"{country_code}{label}-住宅" if country_code else f"{label}-住宅"
 
 def generate_openclash_subscription(
     nodes: list[dict[str, Any]],
@@ -707,8 +601,8 @@ def generate_openclash_subscription(
     password: str | None = None,
 ) -> str:
     residential_nodes = [
-        n for n in apply_residential_metadata([item.copy() for item in nodes], nodes)
-        if n.get("is_residential") and valid_residential_port(parse_int(n.get("assigned_port")))
+        node for node in apply_residential_metadata([item.copy() for item in nodes], nodes)
+        if node.get("is_residential") and valid_residential_port(parse_int(node.get("assigned_port")))
     ]
     residential_nodes.sort(key=lambda n: parse_int(n.get("assigned_port")))
 
@@ -720,7 +614,7 @@ def generate_openclash_subscription(
         name = base_name
         suffix = 2
         while name in used_names:
-            name = f"{base_name}-{suffix}"
+            name = f"{base_name}-{suffix:02d}"
             suffix += 1
         used_names.add(name)
         names.append(name)
@@ -1079,11 +973,6 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "location": "",
         "ip_type": "",
         "quality": "",
-        "is_residential": False,
-        "residential_score": 0,
-        "assigned_port": 0,
-        "fail_count": 0,
-        "cooldown_until": 0,
         "latency_ms": 0,
         "config_file": str(config_path),
         "config_text": config_text,
@@ -1169,20 +1058,28 @@ def fetch_candidates() -> list[dict[str, Any]]:
         else:
             raise RuntimeError(diag_msg)
 
-    try:
-        vpn_utils.enrich_ip_info(candidates)
-    except Exception as exc:
-        print(f"[住宅分类] IP 归属富化失败，将保留未分类状态: {exc}", flush=True)
-        log_to_json("WARNING", "Main", f"住宅 IP 分类失败: {exc}")
-    apply_residential_metadata(candidates, read_nodes())
-                
+    raw_count = len(candidates)
+    previous_nodes = cached_nodes()
+    vpn_utils.enrich_ip_info(candidates)
+    candidates = residential_nodes_only(candidates, previous_nodes)
+    if not candidates:
+        msg = f"Fetched {raw_count} VPNGate candidates, but no residential candidates passed filtering."
+        set_state(
+            last_fetch_at=time.time(),
+            last_fetch_status="ok",
+            last_fetch_message=msg,
+            blacklisted_nodes=len(blacklist),
+        )
+        log_to_json("WARNING", "Main", msg)
+        return []
+
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
-        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        last_fetch_message=f"Fetched {raw_count} unique candidates; kept {len(candidates)} residential candidates.",
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {raw_count} 个候选节点，保留住宅节点 {len(candidates)} 个")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:
@@ -1492,7 +1389,7 @@ def cleanup_policy_routing() -> None:
         pass
 
 def stop_active_openvpn() -> None:
-    global active_openvpn_process, active_openvpn_node_id, active_connected_at
+    global active_openvpn_process, active_openvpn_node_id
     with lock:
         cleanup_policy_routing()
         config_to_delete = None
@@ -1505,7 +1402,6 @@ def stop_active_openvpn() -> None:
         stop_process(active_openvpn_process)
         active_openvpn_process = None
         active_openvpn_node_id = ""
-        active_connected_at = 0.0
         kill_existing_openvpn_processes()
         
         if config_to_delete:
@@ -1524,10 +1420,9 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     available_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
         key=lambda n: (
-            0 if n.get("is_residential") else 1,
+            0 if n.get("ip_type") in ("residential", "mobile") else 1,
             parse_int(n.get("latency_ms")) or 999999,
-            -parse_int(n.get("residential_score")),
-            -parse_int(n.get("score")),
+            -parse_int(n.get("score"))
         )
     )
     untested_nodes = sorted(
@@ -1562,6 +1457,7 @@ def test_config_path(node_id: str) -> Path:
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
         nodes = read_nodes()
+        apply_residential_metadata(nodes, nodes)
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
@@ -1623,8 +1519,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
             
-            apply_residential_metadata(nodes, nodes)
-            sorted_nodes = sort_all_nodes(nodes)
+            sorted_nodes = sort_all_nodes(residential_nodes_only(nodes, nodes))
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
             return res
@@ -1727,8 +1622,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             nid = n.get("id")
             if nid in updated_nodes_map:
                 n.update(updated_nodes_map[nid])
-        apply_residential_metadata(current_nodes, current_nodes)
-        sorted_nodes = sort_all_nodes(current_nodes)
+        sorted_nodes = sort_all_nodes(residential_nodes_only(current_nodes, current_nodes))
         write_json(NODES_FILE, sorted_nodes)
         
     return list(updated_nodes_map.values())
@@ -1751,15 +1645,43 @@ def auto_switch_node(attempt: int = 0) -> None:
         print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
         return
 
+    # Find the next best available node
     with lock:
         nodes = read_nodes()
         apply_residential_metadata(nodes, nodes)
-        candidates, used_fallback = select_switch_candidates(nodes, ui_cfg, allow_fallback=True)
-        
+        candidates = [
+            n for n in nodes
+            if n.get("probe_status") == "available"
+            and not n.get("active")
+            and n.get("is_residential")
+        ]
+
+        if routing_mode == "fixed_region" and target_country:
+            candidates = [
+                n for n in candidates
+                if n.get("country") == target_country
+                or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
+            ]
+        if routing_mode == "favorites":
+            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+            fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
+            if fav_candidates:
+                candidates = fav_candidates
+            else:
+                fav_fail_fallback = ui_cfg.get("fav_fail_fallback", True)
+                if not fav_fail_fallback:
+                    candidates = []
+
+        # 地区列表路线只允许住宅节点作为自动切换候选。
+        routing_ip_type = ui_cfg.get("routing_ip_type", "residential")
+        if routing_ip_type == "hosting":
+            candidates = []
+
+        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+
     if candidates:
         next_node = candidates[0]
-        fallback_note = "（住宅短名单耗尽，按兜底策略降级到可用节点）" if used_fallback else ""
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳住宅备用节点{fallback_note}: {next_node['id']}"
+        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
@@ -1793,7 +1715,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting, active_connected_at
+    global active_openvpn_process, active_openvpn_node_id, is_connecting
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
@@ -1809,10 +1731,10 @@ def connect_node(node_id: str) -> str:
         log_to_json("INFO", "VPN", f"开始连接节点: {node_id}")
 
         nodes = read_nodes()
-        apply_residential_metadata(nodes, nodes)
+        nodes = residential_nodes_only(nodes, nodes)
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
-            raise ValueError(f"Node not found: {node_id}")
+            raise ValueError(f"Residential node not found: {node_id}")
         
         ui_cfg = load_ui_config()
         ui_cfg["connection_enabled"] = True
@@ -1858,12 +1780,11 @@ def connect_node(node_id: str) -> str:
         with lock:
             active_openvpn_process = process
             active_openvpn_node_id = node_id
-            active_connected_at = time.time()
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
         listen_port = active_proxy_port_for_node(node)
-        set_state(active_node_latency="重绑代理", last_check_message=f"正在按当前节点重绑代理监听端口 {listen_port}...")
+        set_state(active_node_latency="重绑代理", last_check_message=f"正在按当前住宅节点重绑 SOCKS 代理端口 {listen_port}...")
         if not rebind_proxy_gateway(listen_port, f"活动节点 {node_id}"):
             raise RuntimeError(f"代理监听端口 {listen_port} 启动失败")
         if not wait_for_proxy_gateway(listen_port, timeout_seconds=10):
@@ -1888,10 +1809,7 @@ def connect_node(node_id: str) -> str:
             item["active"] = item.get("id") == node_id
             if item["active"]:
                 _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-                item["probe_status"] = "available"
-                item["fail_count"] = 0
-                item["cooldown_until"] = 0
-                item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{listen_port}"
+                item["probe_message"] = f"Active residential node. SOCKS5/HTTP proxy: http://{_ph}:{listen_port}"
         apply_residential_metadata(nodes, nodes)
         write_json(NODES_FILE, nodes)
         
@@ -1904,7 +1822,6 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=res["latency_ms"],
                 proxy_error=""
             )
-            reset_node_failure(node_id)
         else:
             set_state(
                 proxy_ok=False,
@@ -2012,7 +1929,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     except Exception:
                         pass
                         
-            apply_residential_metadata(merged, read_nodes())
+            merged = residential_nodes_only(merged, read_nodes())
             write_json(NODES_FILE, merged)
 
         # Test all non-active nodes from the list
@@ -2056,12 +1973,31 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
                     routing_mode = ui_cfg.get("routing_mode", "auto")
+                    target_country = ui_cfg.get("force_country", "")
                     
                     if routing_mode != "fixed_ip":
-                        apply_residential_metadata(merged, merged)
-                        available_candidates, used_fallback = select_switch_candidates(merged, ui_cfg, allow_fallback=True)
-                        if used_fallback:
-                            log_to_json("WARNING", "VPN", "住宅短名单为空，周期维护按兜底策略尝试可用节点")
+                        available_candidates = [n for n in merged if n.get("probe_status") == "available"]
+                        if routing_mode == "fixed_region" and target_country:
+                            available_candidates = [
+                                n for n in available_candidates
+                                if n.get("country") == target_country
+                                or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
+                            ]
+                        elif routing_mode == "favorites":
+                            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+                            fav_candidates = [n for n in available_candidates if n.get("id") in fav_ids]
+                            if fav_candidates:
+                                available_candidates = fav_candidates
+                            else:
+                                fav_fail_fallback = ui_cfg.get("fav_fail_fallback", True)
+                                if not fav_fail_fallback:
+                                    available_candidates = []
+
+                        apply_residential_metadata(available_candidates, merged)
+                        available_candidates = [n for n in available_candidates if n.get("is_residential")]
+                        routing_ip_type = ui_cfg.get("routing_ip_type", "residential")
+                        if routing_ip_type == "hosting":
+                            available_candidates = []
                         
                         if available_candidates:
                             auto_switch_node()
@@ -3312,6 +3248,10 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
     </button>
+    <button id="export_openclash" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+      导出 OpenClash
+    </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
@@ -3362,9 +3302,8 @@ INDEX_HTML = r"""<!doctype html>
       <option value="">所有国家</option>
     </select>
     <select id="ip_type_filter">
-      <option value="">所有IP类型</option>
+      <option value="">全部住宅节点</option>
       <option value="residential">住宅IP</option>
-      <option value="hosting">机房IP</option>
     </select>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -3538,17 +3477,9 @@ INDEX_HTML = r"""<!doctype html>
             <label class="form-label">IP 出站类型过滤</label>
             <input type="hidden" id="net_routing_ip_type" value="residential">
             <div class="option-group" id="routing_ip_type_group">
-              <div class="option-card active" data-value="all" onclick="setRoutingIpType('all')">
-                <div class="option-card-title">所有IP</div>
-                <div class="option-card-desc">机房 + 住宅</div>
-              </div>
-              <div class="option-card" data-value="residential" onclick="setRoutingIpType('residential')">
+              <div class="option-card active" data-value="residential" onclick="setRoutingIpType('residential')">
                 <div class="option-card-title">住宅IP</div>
-                <div class="option-card-desc">静态家宽</div>
-              </div>
-              <div class="option-card" data-value="hosting" onclick="setRoutingIpType('hosting')">
-                <div class="option-card-title">机房IP</div>
-                <div class="option-card-desc">普通机房</div>
+                <div class="option-card-desc">仅保留住宅与移动住宅</div>
               </div>
             </div>
           </div>
@@ -4273,6 +4204,26 @@ $("refresh").onclick=async()=>{
     $("refresh").disabled=false; 
     $("refresh").textContent="更新节点";
   }, 3000);
+};
+$("export_openclash").onclick = async () => {
+  const btn = $("export_openclash");
+  btn.disabled = true;
+  const oldHtml = btn.innerHTML;
+  btn.textContent = "正在导出...";
+  try {
+    const response = await fetch("./api/export_openclash", { method: "POST" });
+    const data = await response.json();
+    if (response.ok && data.ok) {
+      alert(`已导出 OpenClash YAML\n住宅节点数: ${data.residential_nodes}\nVPS 文件: ${data.path}\n订阅地址: ${data.subscription_url}`);
+    } else {
+      alert(data.error || "导出 OpenClash YAML 失败");
+    }
+  } catch (e) {
+    alert("导出 OpenClash YAML 请求失败");
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = oldHtml;
+  }
 };
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
@@ -5113,47 +5064,39 @@ def background_proxy_checker() -> None:
                 continue
 
             res = check_proxy_health()
-            latency_ms = parse_int(res.get("latency_ms"))
-            degraded = bool(res.get("ok") and latency_ms > RESIDENTIAL_WATCHDOG_LATENCY_THRESHOLD_MS)
-            if res["ok"] and not degraded:
+            if res["ok"]:
                 set_state(
                     proxy_ok=True,
                     proxy_ip=res["ip"],
-                    proxy_latency_ms=latency_ms,
+                    proxy_latency_ms=res["latency_ms"],
                     proxy_error=""
                 )
-                if active_openvpn_node_id:
-                    reset_node_failure(active_openvpn_node_id)
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
-                error_msg = (
-                    f"代理延迟 {latency_ms} ms 超过阈值 {RESIDENTIAL_WATCHDOG_LATENCY_THRESHOLD_MS} ms"
-                    if degraded else res.get("error", "未知错误")
-                )
+                error_msg = res.get("error", "未知错误")
                 if active_openvpn_node_id:
                     print(f"[警告] {current_proxy_port()} 端口本地代理当前不可用！原因: {error_msg}", flush=True)
                     log_to_json("WARNING", "Proxy", f"代理不可用: {error_msg}")
                 set_state(
                     proxy_ok=False,
-                    proxy_ip=res.get("ip", "-") if degraded else "-",
-                    proxy_latency_ms=latency_ms if degraded else 0,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
                     proxy_error=error_msg
                 )
 
+                # If we intended to have an active VPN node but proxy failed, trigger auto-switch
                 if active_openvpn_node_id:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
-                        threshold_reached, fail_count = record_node_failure(active_openvpn_node_id, f"代理看门狗失败: {error_msg}")
-                        log_to_json("WARNING", "Proxy", f"节点 {active_openvpn_node_id} 连续失败 {fail_count}/{RESIDENTIAL_WATCHDOG_FAIL_THRESHOLD}")
-                        dwell_seconds = time.time() - active_connected_at if active_connected_at else RESIDENTIAL_MIN_DWELL_SECONDS
-                        if threshold_reached and dwell_seconds >= RESIDENTIAL_MIN_DWELL_SECONDS:
-                            auto_switch_node()
-                        elif threshold_reached:
-                            wait_left = int(RESIDENTIAL_MIN_DWELL_SECONDS - dwell_seconds)
-                            msg = f"节点已达到失败阈值，但仍在最小驻留时间内，{wait_left} 秒后允许切换"
-                            print(f"[代理守护线程] {msg}", flush=True)
-                            log_to_json("INFO", "Proxy", msg)
+                        with lock:
+                            nodes = read_nodes()
+                            active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                            if active_node:
+                                mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
+                                active_node["probe_status"] = "unavailable"
+                                write_json(NODES_FILE, nodes)
+                        auto_switch_node()
                     else:
                         print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
@@ -5164,7 +5107,7 @@ def background_proxy_checker() -> None:
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
-        time.sleep(RESIDENTIAL_WATCHDOG_INTERVAL_SECONDS)
+        time.sleep(30)
 
 def active_node_pinger() -> None:
     global last_pinger_heartbeat
@@ -5286,9 +5229,13 @@ class Handler(BaseHTTPRequestHandler):
             )
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             nodes = read_nodes()
-            apply_residential_metadata(nodes, nodes)
+            nodes = residential_nodes_only(nodes, nodes)
             write_json(NODES_FILE, nodes)
             body = generate_openclash_subscription(nodes, server_host, proxy_user, proxy_pass)
+            try:
+                OPENCLASH_OUTPUT_FILE.write_text(body, encoding="utf-8")
+            except Exception as exc:
+                log_to_json("WARNING", "OpenClash", f"写入 OpenClash YAML 文件失败: {exc}")
             self.send_bytes(body.encode("utf-8"), "text/yaml; charset=utf-8")
             return
         
@@ -5305,6 +5252,8 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
+            nodes = residential_nodes_only(nodes, nodes)
+            write_json(NODES_FILE, nodes)
             active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
                 n["active"] = (active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
@@ -5355,22 +5304,27 @@ class Handler(BaseHTTPRequestHandler):
             proxy_ok = False
             proxy_err = ""
             proxy_port = current_proxy_port()
+            is_ipv6 = ":" in LOCAL_PROXY_HOST
+            af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
             s = None
             try:
-                for connect_host in proxy_connect_hosts():
-                    af = socket.AF_INET6 if ":" in connect_host else socket.AF_INET
-                    s = socket.socket(af, socket.SOCK_STREAM)
-                    s.settimeout(0.5)
-                    try:
-                        s.connect((connect_host, proxy_port))
-                        proxy_ok = True
-                        break
-                    except Exception:
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                connect_host = LOCAL_PROXY_HOST
+                if connect_host in ("::", "0.0.0.0", ""):
+                    connect_host = "::1" if is_ipv6 else "127.0.0.1"
+                try:
+                    s.connect((connect_host, proxy_port))
+                    proxy_ok = True
+                except Exception:
+                    if connect_host == "::1":
                         s.close()
-                        s = None
-                        continue
-                if not proxy_ok:
-                    raise RuntimeError("all local proxy connect attempts failed")
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.5)
+                        s.connect(("127.0.0.1", proxy_port))
+                        proxy_ok = True
+                    else:
+                        raise
             except Exception as e:
                 diag = vpn_utils.diagnose_local_obstructions(proxy_port, host=LOCAL_PROXY_HOST)
                 proxy_err = diag[1] if diag else f"本地代理网关无法连通: {e}"
@@ -5609,6 +5563,7 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
+                routing_ip_type = "residential"
                 
                 ui_cfg = load_ui_config()
                 expected_proxy_port = ui_cfg.get("proxy_port", 7928)
@@ -5657,6 +5612,7 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
+                routing_ip_type = "residential"
                 
                 ui_cfg = load_ui_config()
                 ui_cfg["routing_mode"] = routing_mode
@@ -5713,6 +5669,28 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
                     self.send_json({"ok": True, "message": "已在后台启动节点更新流程", "running": False})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/export_openclash":
+            try:
+                server_host = os.environ.get("OPENCLASH_SERVER_HOST") or host_for_subscription(
+                    self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+                )
+                proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
+                nodes = read_nodes()
+                nodes = residential_nodes_only(nodes, nodes)
+                write_json(NODES_FILE, nodes)
+                body = generate_openclash_subscription(nodes, server_host, proxy_user, proxy_pass)
+                OPENCLASH_OUTPUT_FILE.write_text(body, encoding="utf-8")
+                host_header = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or f"{server_host}:{UI_PORT}"
+                sub_url = f"http://{host_header}/{self.get_secret_path()}/sub.yaml"
+                count = len([n for n in nodes if n.get("is_residential")])
+                self.send_json({
+                    "ok": True,
+                    "path": str(OPENCLASH_OUTPUT_FILE),
+                    "subscription_url": sub_url,
+                    "residential_nodes": count,
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
@@ -5820,7 +5798,7 @@ def main() -> None:
             "target_valid_nodes": TARGET_VALID_NODES,
             "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
-            "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{active_listen_port}",
+            "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
             "active_listen_port": active_listen_port,
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",

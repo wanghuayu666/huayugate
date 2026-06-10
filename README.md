@@ -45,7 +45,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wanghuayu666/huayugate/main/in
    - **固定 IP 节点**：始终锁定连接到这一个特定节点。
 
 #### 第三步：使用本机代理 (核心步骤)
-为了防止代理端口暴露至公网被恶意扫描和滥用，huayu 的双效代理服务（默认端口 **`7928`**，自适应支持 SOCKS5 和 HTTP 协议）**默认仅绑定在本地回环地址（`127.0.0.1`）**，只接收 VPS 本机上的流量，不对外机提供代理。
+huayu 的双效代理服务（默认端口 **`7928`**，自适应支持 SOCKS5 和 HTTP 协议）源码默认适合 VPS 本机使用；本仓库一键脚本会为了 OpenClash 接入自动写入 `LOCAL_PROXY_HOST=::` 和随机 SOCKS5 认证，让路由器能够访问当前活动住宅节点端口。
 
 * **🐍 Python 脚本中使用代理**:
   ```python
@@ -65,13 +65,23 @@ bash <(curl -Ls https://raw.githubusercontent.com/wanghuayu666/huayugate/main/in
 * **⚙️ 本地其他服务配置**:
   将本机的其他代理工具、爬虫框架或服务的出战代理设置为 `127.0.0.1:7928`。
 
-> 💡 **小贴士**：如果您确实需要对公网其他设备开放此代理端口，可以通过设置环境变量 `export LOCAL_PROXY_HOST="::"` 重新启动服务以允许公网接入。
+> 💡 **小贴士**：如果您只需要 VPS 本机使用代理，可把 `/etc/default/huayu` 里的 `LOCAL_PROXY_HOST=::` 改回 `LOCAL_PROXY_HOST=127.0.0.1` 后重启服务。
+
+#### 第四步：导出给 OpenClash
+huayu 会只保留住宅与移动住宅节点，并为每个住宅节点分配一个 SOCKS5 本地端口。OpenClash YAML 里的节点数量会和当前 VPS 节点池里的住宅 IP 数量一致，节点名格式为 `JP日本东京都-住宅`，同名地区会自动追加序号。
+
+1. 在 Web 管理后台点击 **“更新节点”**，等待住宅节点池刷新完成。
+2. 点击顶部 **“导出 OpenClash”**，文件会写入 VPS：`/opt/huayu/vpngate_data/openclash.yaml`。
+3. 在 OpenClash 里添加订阅：`http://VPS公网IP:8787/安全后缀/sub.yaml`。
+
+如果 OpenClash 显示的 `server` 不是 VPS 公网 IP，可在 `/etc/default/huayu` 中设置 `OPENCLASH_SERVER_HOST=你的VPS公网IP` 后重启 `huayu` 服务。使用一键脚本安装时，脚本会自动写入 `LOCAL_PROXY_HOST=::` 和随机 SOCKS5 认证，订阅 YAML 会自动带上认证信息。
 
 ---
 
 ### 🛠️ 核心功能与操作说明
 
 * **合并操作面板**：将“更新节点”与“立即检测补齐”合并，一键触发多线程拉取与测速。
+* **OpenClash 订阅导出**：只导出住宅节点，按地区生成 SOCKS5 节点列表，并同步写入 `/opt/huayu/vpngate_data/openclash.yaml`。
 * **网关状态面板**：
   - **系统诊断**：检测网关心跳及后台各个子守护线程（网页服务、VPN连接管理、出站网关服务）是否正常运行。若有脚本未运行，会提示具体的异常原因。
   - **本地代理出口检测**：在网页端直接一键检测 VPS 后台对海外的实际连通状况，并回显真实的代理出站 IP 和所在地理位置。
@@ -88,14 +98,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/wanghuayu666/huayugate/main/in
 * **解决办法**：请登录您的 VPS 服务商控制面板（如 SolusVM/Proxmox），找到 **Enable TUN/TAP** / **开启 TUN** 选项并启用，然后重启 VPS。如无此选项，请工单联系客服开启。
 
 #### 2. 网页管理后台无法打开（链接超时或拒绝连接）
-* **原因 1**：VPS 本身自带防火墙（如 UFW、firewalld 或 iptables）阻断了管理端口（默认 `8787`）或代理端口（默认 `7928`）。
+* **原因 1**：VPS 本身自带防火墙（如 UFW、firewalld 或 iptables）阻断了管理端口（默认 `8787`）、本机代理端口（默认 `7928`）或 OpenClash 住宅节点端口段（默认从 `20000` 开始）。
 * **解决办法 1**：请在终端放行对应端口：
-  * **UFW (Ubuntu/Debian)**: `ufw allow 8787/tcp && ufw allow 7928/tcp`
-  * **Firewalld (CentOS/RHEL)**: `firewall-cmd --zone=public --add-port=8787/tcp --permanent && firewall-cmd --zone=public --add-port=7928/tcp --permanent && firewall-cmd --reload`
+  * **UFW (Ubuntu/Debian)**: `ufw allow 8787/tcp && ufw allow 7928/tcp && ufw allow 20000:20999/tcp`
+  * **Firewalld (CentOS/RHEL)**: `firewall-cmd --zone=public --add-port=8787/tcp --permanent && firewall-cmd --zone=public --add-port=7928/tcp --permanent && firewall-cmd --zone=public --add-port=20000-20999/tcp --permanent && firewall-cmd --reload`
 * **原因 2**：云服务商的“安全组”或“网络访问控制列表 (ACL)”未放行端口。
 * **解决办法 2**：**非常重要！** 登录云服务商控制台（如阿里云、腾讯云、AWS、Oracle Cloud等），找到您 VPS 实例的 **安全组规则 (Security Group)**，在入站规则中添加：
   - **协议类型**: `TCP`
-  - **端口范围**: `8787` (管理网页) 和 `7928` (代理端口)
+  - **端口范围**: `8787` (管理网页)、`7928` (本机代理端口) 和 `20000-20999` (OpenClash 住宅节点端口段)
   - **授权对象/源IP**: `0.0.0.0/0` (允许所有人，或指定您自己的家庭公网 IP 提高安全性)
 
 #### 3. 页面提示 `API Domain Blocked` 且备选节点显示为 0

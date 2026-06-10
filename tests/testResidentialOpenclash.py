@@ -1,141 +1,79 @@
-import os
-import sys
-import tempfile
-import time
 import unittest
-from pathlib import Path
+
+import vpngate_manager as manager
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-TMP_DIR = tempfile.TemporaryDirectory()
-os.environ["VPNGATE_DATA_DIR"] = TMP_DIR.name
-os.environ["RESIDENTIAL_PORT_BASE"] = "20000"
-os.environ["OPENCLASH_GROUP_NAME"] = "Residential"
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-import vpngate_manager as manager  # noqa: E402
-
-
-class ResidentialOpenClashTests(unittest.TestCase):
-    def test_residential_metadata_preserves_ports_and_filters_datacenter_asn(self):
-        previous = [
-            {
-                "id": "home",
-                "assigned_port": 20005,
-                "fail_count": 2,
-                "cooldown_until": 123.0,
-            }
-        ]
+class OpenClashResidentialTests(unittest.TestCase):
+    def test_residential_nodes_get_stable_ports_and_hosting_is_excluded(self):
         nodes = [
             {
-                "id": "home",
-                "ip": "1.2.3.4",
-                "ip_type": "residential",
-                "quality": "normal",
-                "asn": "AS123 Local ISP",
-                "score": 8000,
-                "latency_ms": 120,
-            },
-            {
-                "id": "aws",
-                "ip": "5.6.7.8",
-                "ip_type": "residential",
-                "quality": "normal",
-                "as_name": "Amazon Technologies",
-                "score": 9000,
-                "latency_ms": 80,
-            },
-            {
-                "id": "mobile",
-                "ip": "9.9.9.9",
-                "ip_type": "mobile",
-                "quality": "mobile",
-                "owner": "Mobile ISP",
-                "score": 3000,
-                "latency_ms": 200,
-            },
-        ]
-
-        result = manager.apply_residential_metadata(nodes, previous)
-        by_id = {node["id"]: node for node in result}
-
-        self.assertTrue(by_id["home"]["is_residential"])
-        self.assertEqual(by_id["home"]["assigned_port"], 20005)
-        self.assertEqual(by_id["home"]["fail_count"], 2)
-        self.assertEqual(by_id["home"]["cooldown_until"], 123.0)
-        self.assertFalse(by_id["aws"]["is_residential"])
-        self.assertEqual(by_id["aws"]["assigned_port"], 0)
-        self.assertTrue(by_id["mobile"]["is_residential"])
-        self.assertEqual(by_id["mobile"]["assigned_port"], 20000)
-
-    def test_select_switch_candidates_prefers_available_residential_and_skips_cooldown(self):
-        now = time.time()
-        nodes = [
-            {"id": "active", "probe_status": "available", "active": True, "ip_type": "residential", "quality": "normal", "latency_ms": 10},
-            {"id": "cooldown", "probe_status": "available", "ip_type": "residential", "quality": "normal", "latency_ms": 20, "cooldown_until": now + 3600},
-            {"id": "slow", "probe_status": "available", "ip_type": "residential", "quality": "normal", "latency_ms": 400, "score": 100},
-            {"id": "fast", "probe_status": "available", "ip_type": "residential", "quality": "normal", "latency_ms": 60, "score": 100},
-            {"id": "hosting", "probe_status": "available", "ip_type": "hosting", "quality": "datacenter", "latency_ms": 5},
-        ]
-        manager.apply_residential_metadata(nodes, nodes)
-
-        candidates, used_fallback = manager.select_switch_candidates(
-            nodes,
-            {"routing_mode": "auto", "routing_ip_type": "residential"},
-            allow_fallback=True,
-        )
-
-        self.assertFalse(used_fallback)
-        self.assertEqual([node["id"] for node in candidates], ["fast", "slow"])
-
-    def test_select_switch_candidates_falls_back_when_residential_pool_is_empty(self):
-        nodes = [
-            {"id": "bad-home", "probe_status": "unavailable", "ip_type": "residential", "quality": "normal", "latency_ms": 20},
-            {"id": "hosting", "probe_status": "available", "ip_type": "hosting", "quality": "datacenter", "latency_ms": 5},
-        ]
-        manager.apply_residential_metadata(nodes, nodes)
-
-        candidates, used_fallback = manager.select_switch_candidates(
-            nodes,
-            {"routing_mode": "auto", "routing_ip_type": "residential"},
-            allow_fallback=True,
-        )
-
-        self.assertTrue(used_fallback)
-        self.assertEqual([node["id"] for node in candidates], ["hosting"])
-
-    def test_openclash_subscription_lists_only_residential_ports_with_credentials(self):
-        nodes = [
-            {
-                "id": "jp",
+                "id": "jp1",
+                "country": "日本",
                 "country_short": "JP",
-                "location": "日本 东京",
-                "ip": "1.2.3.4",
+                "location": "日本 东京都",
                 "ip_type": "residential",
                 "quality": "normal",
+                "owner": "Sony Network Communications",
+            },
+            {
+                "id": "us1",
+                "country": "美国",
+                "country_short": "US",
+                "location": "美国 加利福尼亚州",
+                "ip_type": "hosting",
+                "quality": "datacenter",
+                "owner": "Amazon",
+            },
+        ]
+
+        residential = manager.residential_nodes_only(nodes, [])
+
+        self.assertEqual([node["id"] for node in residential], ["jp1"])
+        self.assertTrue(residential[0]["is_residential"])
+        self.assertGreaterEqual(residential[0]["assigned_port"], manager.RESIDENTIAL_PORT_BASE)
+
+    def test_openclash_yaml_count_matches_residential_nodes_and_names_are_unique(self):
+        nodes = [
+            {
+                "id": "jp1",
+                "country": "日本",
+                "country_short": "JP",
+                "location": "日本 东京都",
+                "ip_type": "residential",
+                "quality": "normal",
+                "owner": "Sony Network Communications",
+                "assigned_port": 20000,
+            },
+            {
+                "id": "jp2",
+                "country": "日本",
+                "country_short": "JP",
+                "location": "日本 东京都",
+                "ip_type": "residential",
+                "quality": "normal",
+                "owner": "SoftBank",
                 "assigned_port": 20001,
             },
             {
-                "id": "hk",
-                "country_short": "HK",
-                "location": "中国香港",
-                "ip": "5.6.7.8",
+                "id": "kr1",
+                "country": "韩国",
+                "country_short": "KR",
+                "location": "韩国 首尔",
                 "ip_type": "hosting",
                 "quality": "datacenter",
-                "assigned_port": 20002,
+                "owner": "Cloud Hosting",
+                "assigned_port": 0,
             },
         ]
 
-        body = manager.generate_openclash_subscription(nodes, "vps.example.com", "user", "pass")
+        yaml_text = manager.generate_openclash_subscription(nodes, "203.0.113.10")
 
-        self.assertIn('server: "vps.example.com"', body)
-        self.assertIn("port: 20001", body)
-        self.assertIn('username: "user"', body)
-        self.assertIn('password: "pass"', body)
-        self.assertIn('"JP-日本 东京-1.2.3.4"', body)
-        self.assertNotIn("5.6.7.8", body)
-        self.assertIn("type: url-test", body)
+        self.assertEqual(yaml_text.count("type: socks5"), 2)
+        self.assertIn('name: "JP日本东京都-住宅"', yaml_text)
+        self.assertIn('name: "JP日本东京都-住宅-02"', yaml_text)
+        self.assertIn("port: 20000", yaml_text)
+        self.assertIn("port: 20001", yaml_text)
+        self.assertNotIn("KR韩国首尔-住宅", yaml_text)
 
 
 if __name__ == "__main__":

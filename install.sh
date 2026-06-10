@@ -47,7 +47,7 @@ echo -e "${BLUE}        欢迎使用 huayu 一键源码部署与管理脚本${PL
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the huayu repository
+# Default to the official repository (wanghuayu666/huayugate)
 DEFAULT_USER="wanghuayu666"
 DEFAULT_REPO="huayugate"
 
@@ -84,6 +84,36 @@ fi
 INSTALL_DIR="/opt/huayu"
 # 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
 DEFAULT_DEPLOY_BRANCH="main"
+ENV_FILE="/etc/default/huayu"
+
+ensure_env_key() {
+    local key="$1"
+    local value="$2"
+    if ! grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        echo "${key}=${value}" >> "$ENV_FILE"
+    fi
+}
+
+set_env_key() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+    else
+        echo "${key}=${value}" >> "$ENV_FILE"
+    fi
+}
+
+echo -e "\n${YELLOW}[OpenClash] 正在配置住宅 SOCKS5 出口环境...${PLAIN}"
+mkdir -p "$(dirname "$ENV_FILE")"
+touch "$ENV_FILE"
+chmod 600 "$ENV_FILE" 2>/dev/null || true
+PROXY_AUTH_USER=$(python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; print("huayu_" + "".join(secrets.choice(a) for _ in range(8)))')
+PROXY_AUTH_PASS=$(python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; print("".join(secrets.choice(a) for _ in range(24)))')
+set_env_key "LOCAL_PROXY_HOST" "::"
+set_env_key "RESIDENTIAL_PORT_BASE" "20000"
+ensure_env_key "LOCAL_PROXY_USER" "$PROXY_AUTH_USER"
+ensure_env_key "LOCAL_PROXY_PASS" "$PROXY_AUTH_PASS"
 
 # 自动检测本地已安装版本当前所在的分支
 CURRENT_BRANCH=""
@@ -162,6 +192,11 @@ command_args="${INSTALL_DIR}/vpngate_manager.py"
 command_background="yes"
 directory="${INSTALL_DIR}"
 pidfile="/run/huayu.pid"
+
+if [ -f /etc/default/huayu ]; then
+    . /etc/default/huayu
+    export LOCAL_PROXY_HOST LOCAL_PROXY_USER LOCAL_PROXY_PASS RESIDENTIAL_PORT_BASE OPENCLASH_SERVER_HOST
+fi
 
 depend() {
     need net
@@ -1174,7 +1209,10 @@ if [ -n "$PUBLIC_IPV6" ]; then
 fi
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
+echo -e "  * 本机 HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
+echo -e "  * OpenClash 订阅地址:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/sub.yaml${PLAIN}"
+echo -e "  * OpenClash YAML 文件:  ${BLUE}${INSTALL_DIR}/vpngate_data/openclash.yaml${PLAIN}"
+echo -e "  * 住宅 SOCKS5 节点端口:  ${BLUE}从 20000 开始按住宅节点顺序分配，仅当前活动节点端口会监听${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
